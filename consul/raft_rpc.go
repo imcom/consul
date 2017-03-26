@@ -1,12 +1,13 @@
 package consul
 
 import (
-	"crypto/tls"
 	"fmt"
-	"github.com/hashicorp/consul/tlsutil"
 	"net"
 	"sync"
 	"time"
+
+	"github.com/hashicorp/consul/tlsutil"
+	"github.com/hashicorp/raft"
 )
 
 // RaftLayer implements the raft.StreamLayer interface,
@@ -18,8 +19,8 @@ type RaftLayer struct {
 	// connCh is used to accept connections
 	connCh chan net.Conn
 
-	// TLS configuration
-	tlsConfig *tls.Config
+	// TLS wrapper
+	tlsWrap tlsutil.Wrapper
 
 	// Tracks if we are closed
 	closed    bool
@@ -30,12 +31,12 @@ type RaftLayer struct {
 // NewRaftLayer is used to initialize a new RaftLayer which can
 // be used as a StreamLayer for Raft. If a tlsConfig is provided,
 // then the connection will use TLS.
-func NewRaftLayer(addr net.Addr, tlsConfig *tls.Config) *RaftLayer {
+func NewRaftLayer(addr net.Addr, tlsWrap tlsutil.Wrapper) *RaftLayer {
 	layer := &RaftLayer{
-		addr:      addr,
-		connCh:    make(chan net.Conn),
-		tlsConfig: tlsConfig,
-		closeCh:   make(chan struct{}),
+		addr:    addr,
+		connCh:  make(chan net.Conn),
+		tlsWrap: tlsWrap,
+		closeCh: make(chan struct{}),
 	}
 	return layer
 }
@@ -80,14 +81,14 @@ func (l *RaftLayer) Addr() net.Addr {
 }
 
 // Dial is used to create a new outgoing connection
-func (l *RaftLayer) Dial(address string, timeout time.Duration) (net.Conn, error) {
-	conn, err := net.DialTimeout("tcp", address, timeout)
+func (l *RaftLayer) Dial(address raft.ServerAddress, timeout time.Duration) (net.Conn, error) {
+	conn, err := net.DialTimeout("tcp", string(address), timeout)
 	if err != nil {
 		return nil, err
 	}
 
 	// Check for tls mode
-	if l.tlsConfig != nil {
+	if l.tlsWrap != nil {
 		// Switch the connection into TLS mode
 		if _, err := conn.Write([]byte{byte(rpcTLS)}); err != nil {
 			conn.Close()
@@ -95,7 +96,7 @@ func (l *RaftLayer) Dial(address string, timeout time.Duration) (net.Conn, error
 		}
 
 		// Wrap the connection in a TLS client
-		conn, err = tlsutil.WrapTLSClient(conn, l.tlsConfig)
+		conn, err = l.tlsWrap(conn)
 		if err != nil {
 			return nil, err
 		}

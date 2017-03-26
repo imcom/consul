@@ -36,6 +36,10 @@ func (s *HTTPServer) EventFire(resp http.ResponseWriter, req *http.Request) (int
 		return nil, nil
 	}
 
+	// Get the ACL token
+	var token string
+	s.parseToken(req, &token)
+
 	// Get the filters
 	if filt := req.URL.Query().Get("node"); filt != "" {
 		event.NodeFilter = filt
@@ -57,7 +61,13 @@ func (s *HTTPServer) EventFire(resp http.ResponseWriter, req *http.Request) (int
 	}
 
 	// Try to fire the event
-	if err := s.agent.UserEvent(dc, event); err != nil {
+	if err := s.agent.UserEvent(dc, token, event); err != nil {
+		if strings.Contains(err.Error(), permissionDenied) {
+			resp.WriteHeader(403)
+			resp.Write([]byte(permissionDenied))
+			return nil, nil
+		}
+		resp.WriteHeader(500)
 		return nil, err
 	}
 
@@ -73,13 +83,21 @@ func (s *HTTPServer) EventList(resp http.ResponseWriter, req *http.Request) (int
 		return nil, nil
 	}
 
+	// Fetch the ACL token, if any.
+	var token string
+	s.parseToken(req, &token)
+	acl, err := s.agent.resolveToken(token)
+	if err != nil {
+		return nil, err
+	}
+
 	// Look for a name filter
 	var nameFilter string
 	if filt := req.URL.Query().Get("name"); filt != "" {
 		nameFilter = filt
 	}
 
-	// Lots of this logic is borrowed from consul/rpc.go:blockingRPC
+	// Lots of this logic is borrowed from consul/rpc.go:blockingQuery
 	// However we cannot use that directly since this code has some
 	// slight semantics differences...
 	var timeout <-chan time.Time
@@ -116,7 +134,20 @@ RUN_QUERY:
 	// Get the recent events
 	events := s.agent.UserEvents()
 
-	// Filter the events if necessary
+	// Filter the events using the ACL, if present
+	if acl != nil {
+		for i := 0; i < len(events); i++ {
+			name := events[i].Name
+			if acl.EventRead(name) {
+				continue
+			}
+			s.agent.logger.Printf("[DEBUG] agent: dropping event %q from result due to ACLs", name)
+			events = append(events[:i], events[i+1:]...)
+			i--
+		}
+	}
+
+	// Filter the events if requested
 	if nameFilter != "" {
 		for i := 0; i < len(events); i++ {
 			if events[i].Name != nameFilter {

@@ -6,8 +6,25 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net"
+	"strings"
 	"time"
 )
+
+// DCWrapper is a function that is used to wrap a non-TLS connection
+// and returns an appropriate TLS connection or error. This takes
+// a datacenter as an argument.
+type DCWrapper func(dc string, conn net.Conn) (net.Conn, error)
+
+// Wrapper is a variant of DCWrapper, where the DC is provided as
+// a constant value. This is usually done by currying DCWrapper.
+type Wrapper func(conn net.Conn) (net.Conn, error)
+
+// TLSLookup maps the tls_min_version configuration to the internal value
+var TLSLookup = map[string]uint16{
+	"tls10": tls.VersionTLS10,
+	"tls11": tls.VersionTLS11,
+	"tls12": tls.VersionTLS12,
+}
 
 // Config used to create tls.Config
 type Config struct {
@@ -21,6 +38,14 @@ type Config struct {
 	// must match a provided certificate authority. This is used to verify authenticity of
 	// server nodes.
 	VerifyOutgoing bool
+
+	// VerifyServerHostname is used to enable hostname verification of servers. This
+	// ensures that the certificate presented is valid for server.<datacenter>.<domain>.
+	// This prevents a compromised client from being restarted as a server, and then
+	// intercepting request traffic as well as being added as a raft peer. This should be
+	// enabled by default with VerifyOutgoing, but for legacy reasons we cannot break
+	// existing clients.
+	VerifyServerHostname bool
 
 	// CAFile is a path to a certificate authority file. This is used with VerifyIncoming
 	// or VerifyOutgoing to verify the TLS connection.
@@ -40,6 +65,12 @@ type Config struct {
 	// ServerName is used with the TLS certificate to ensure the name we
 	// provide matches the certificate
 	ServerName string
+
+	// Domain is the Consul TLD being used. Defaults to "consul."
+	Domain string
+
+	// TLSMinVersion is the minimum accepted TLS version that can be used.
+	TLSMinVersion string
 }
 
 // AppendCA opens and parses the CA file and adds the certificates to
@@ -78,6 +109,10 @@ func (c *Config) KeyPair() (*tls.Certificate, error) {
 // requests. It will return a nil config if this configuration should
 // not use TLS for outgoing connections.
 func (c *Config) OutgoingTLSConfig() (*tls.Config, error) {
+	// If VerifyServerHostname is true, that implies VerifyOutgoing
+	if c.VerifyServerHostname {
+		c.VerifyOutgoing = true
+	}
 	if !c.VerifyOutgoing {
 		return nil, nil
 	}
@@ -88,6 +123,11 @@ func (c *Config) OutgoingTLSConfig() (*tls.Config, error) {
 	}
 	if c.ServerName != "" {
 		tlsConfig.ServerName = c.ServerName
+		tlsConfig.InsecureSkipVerify = false
+	}
+	if c.VerifyServerHostname {
+		// ServerName is filled in dynamically based on the target DC
+		tlsConfig.ServerName = "VerifyServerHostname"
 		tlsConfig.InsecureSkipVerify = false
 	}
 
@@ -110,7 +150,94 @@ func (c *Config) OutgoingTLSConfig() (*tls.Config, error) {
 		tlsConfig.Certificates = []tls.Certificate{*cert}
 	}
 
+	// Check if a minimum TLS version was set
+	if c.TLSMinVersion != "" {
+		tlsvers, ok := TLSLookup[c.TLSMinVersion]
+		if !ok {
+			return nil, fmt.Errorf("TLSMinVersion: value %s not supported, please specify one of [tls10,tls11,tls12]", c.TLSMinVersion)
+		}
+		tlsConfig.MinVersion = tlsvers
+	}
+
 	return tlsConfig, nil
+}
+
+// Clone returns a copy of c. Only the exported fields are copied. This
+// was copied from https://golang.org/src/crypto/tls/common.go since that
+// isn't exported and Go 1.7's vet uncovered an unsafe copy of a mutex in
+// here.
+//
+// TODO (slackpad) - This can be removed once we move to Go 1.8, see
+// https://github.com/golang/go/commit/d24f446 for details.
+func clone(c *tls.Config) *tls.Config {
+	return &tls.Config{
+		Rand:                        c.Rand,
+		Time:                        c.Time,
+		Certificates:                c.Certificates,
+		NameToCertificate:           c.NameToCertificate,
+		GetCertificate:              c.GetCertificate,
+		RootCAs:                     c.RootCAs,
+		NextProtos:                  c.NextProtos,
+		ServerName:                  c.ServerName,
+		ClientAuth:                  c.ClientAuth,
+		ClientCAs:                   c.ClientCAs,
+		InsecureSkipVerify:          c.InsecureSkipVerify,
+		CipherSuites:                c.CipherSuites,
+		PreferServerCipherSuites:    c.PreferServerCipherSuites,
+		SessionTicketsDisabled:      c.SessionTicketsDisabled,
+		SessionTicketKey:            c.SessionTicketKey,
+		ClientSessionCache:          c.ClientSessionCache,
+		MinVersion:                  c.MinVersion,
+		MaxVersion:                  c.MaxVersion,
+		CurvePreferences:            c.CurvePreferences,
+		DynamicRecordSizingDisabled: c.DynamicRecordSizingDisabled,
+		Renegotiation:               c.Renegotiation,
+	}
+}
+
+// OutgoingTLSWrapper returns a a DCWrapper based on the OutgoingTLS
+// configuration. If hostname verification is on, the wrapper
+// will properly generate the dynamic server name for verification.
+func (c *Config) OutgoingTLSWrapper() (DCWrapper, error) {
+	// Get the TLS config
+	tlsConfig, err := c.OutgoingTLSConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	// Check if TLS is not enabled
+	if tlsConfig == nil {
+		return nil, nil
+	}
+
+	// Strip the trailing '.' from the domain if any
+	domain := strings.TrimSuffix(c.Domain, ".")
+
+	// Generate the wrapper based on hostname verification
+	if c.VerifyServerHostname {
+		wrapper := func(dc string, conn net.Conn) (net.Conn, error) {
+			conf := clone(tlsConfig)
+			conf.ServerName = "server." + dc + "." + domain
+			return WrapTLSClient(conn, conf)
+		}
+		return wrapper, nil
+	} else {
+		wrapper := func(dc string, c net.Conn) (net.Conn, error) {
+			return WrapTLSClient(c, tlsConfig)
+		}
+		return wrapper, nil
+	}
+}
+
+// SpecificDC is used to invoke a static datacenter
+// and turns a DCWrapper into a Wrapper type.
+func SpecificDC(dc string, tlsWrap DCWrapper) Wrapper {
+	if tlsWrap == nil {
+		return nil
+	}
+	return func(conn net.Conn) (net.Conn, error) {
+		return tlsWrap(dc, conn)
+	}
 }
 
 // Wrap a net.Conn into a client tls connection, performing any
@@ -201,6 +328,15 @@ func (c *Config) IncomingTLSConfig() (*tls.Config, error) {
 		if cert == nil {
 			return nil, fmt.Errorf("VerifyIncoming set, and no Cert/Key pair provided!")
 		}
+	}
+
+	// Check if a minimum TLS version was set
+	if c.TLSMinVersion != "" {
+		tlsvers, ok := TLSLookup[c.TLSMinVersion]
+		if !ok {
+			return nil, fmt.Errorf("TLSMinVersion: value %s not supported, please specify one of [tls10,tls11,tls12]", c.TLSMinVersion)
+		}
+		tlsConfig.MinVersion = tlsvers
 	}
 	return tlsConfig, nil
 }

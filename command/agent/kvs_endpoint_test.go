@@ -3,13 +3,14 @@ package agent
 import (
 	"bytes"
 	"fmt"
-	"github.com/hashicorp/consul/consul/structs"
-	"github.com/hashicorp/consul/testutil"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"reflect"
 	"testing"
+
+	"github.com/hashicorp/consul/consul/structs"
+	"github.com/hashicorp/consul/testutil"
 )
 
 func TestKVSEndpoint_PUT_GET_DELETE(t *testing.T) {
@@ -180,6 +181,93 @@ func TestKVSEndpoint_Recurse(t *testing.T) {
 		if obj != nil {
 			t.Fatalf("bad: %v", obj)
 		}
+	}
+}
+
+func TestKVSEndpoint_DELETE_CAS(t *testing.T) {
+	dir, srv := makeHTTPServer(t)
+	defer os.RemoveAll(dir)
+	defer srv.Shutdown()
+	defer srv.agent.Shutdown()
+
+	testutil.WaitForLeader(t, srv.agent.RPC, "dc1")
+
+	{
+		buf := bytes.NewBuffer([]byte("test"))
+		req, err := http.NewRequest("PUT", "/v1/kv/test", buf)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		resp := httptest.NewRecorder()
+		obj, err := srv.KVSEndpoint(resp, req)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		if res := obj.(bool); !res {
+			t.Fatalf("should work")
+		}
+	}
+
+	req, err := http.NewRequest("GET", "/v1/kv/test", nil)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	resp := httptest.NewRecorder()
+	obj, err := srv.KVSEndpoint(resp, req)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	d := obj.(structs.DirEntries)[0]
+
+	// Create a CAS request, bad index
+	{
+		buf := bytes.NewBuffer([]byte("zip"))
+		req, err := http.NewRequest("DELETE",
+			fmt.Sprintf("/v1/kv/test?cas=%d", d.ModifyIndex-1), buf)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		resp := httptest.NewRecorder()
+		obj, err := srv.KVSEndpoint(resp, req)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		if res := obj.(bool); res {
+			t.Fatalf("should NOT work")
+		}
+	}
+
+	// Create a CAS request, good index
+	{
+		buf := bytes.NewBuffer([]byte("zip"))
+		req, err := http.NewRequest("DELETE",
+			fmt.Sprintf("/v1/kv/test?cas=%d", d.ModifyIndex), buf)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		resp := httptest.NewRecorder()
+		obj, err := srv.KVSEndpoint(resp, req)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		if res := obj.(bool); !res {
+			t.Fatalf("should work")
+		}
+	}
+
+	// Verify the delete
+	req, _ = http.NewRequest("GET", "/v1/kv/test", nil)
+	resp = httptest.NewRecorder()
+	obj, _ = srv.KVSEndpoint(resp, req)
+	if obj != nil {
+		t.Fatalf("should be destroyed")
 	}
 }
 
@@ -440,6 +528,48 @@ func TestKVSEndpoint_GET_Raw(t *testing.T) {
 		// Check the body
 		if !bytes.Equal(resp.Body.Bytes(), []byte("test")) {
 			t.Fatalf("bad: %s", resp.Body.Bytes())
+		}
+	})
+}
+
+func TestKVSEndpoint_PUT_ConflictingFlags(t *testing.T) {
+	httpTest(t, func(srv *HTTPServer) {
+		req, err := http.NewRequest("PUT", "/v1/kv/test?cas=0&acquire=xxx", nil)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		resp := httptest.NewRecorder()
+		if _, err := srv.KVSEndpoint(resp, req); err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		if resp.Code != 400 {
+			t.Fatalf("expected 400, got %d", resp.Code)
+		}
+		if !bytes.Contains(resp.Body.Bytes(), []byte("Conflicting")) {
+			t.Fatalf("expected conflicting args error")
+		}
+	})
+}
+
+func TestKVSEndpoint_DELETE_ConflictingFlags(t *testing.T) {
+	httpTest(t, func(srv *HTTPServer) {
+		req, err := http.NewRequest("DELETE", "/v1/kv/test?recurse&cas=0", nil)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		resp := httptest.NewRecorder()
+		if _, err := srv.KVSEndpoint(resp, req); err != nil {
+			t.Fatalf("err: %v", err)
+		}
+
+		if resp.Code != 400 {
+			t.Fatalf("expected 400, got %d", resp.Code)
+		}
+		if !bytes.Contains(resp.Body.Bytes(), []byte("Conflicting")) {
+			t.Fatalf("expected conflicting args error")
 		}
 	})
 }

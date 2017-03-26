@@ -16,7 +16,6 @@
         padding-left: 0px;
         color: $gray;
         font-size: 13px;
-        height: 20px;
     }
 
     .list-group-item-heading {
@@ -74,12 +73,19 @@
             }
 
             small {
-                display:inline-block;
+                display: inline-block;
                 padding-right: 8px;
                 padding-top: 2px;
                 font-size: 12px;
                 color: $gray-light;
             }
+        }
+
+        .metadata {
+            display: block;
+            font-size: 12px;
+            float: left;
+            color: $gray-light;
         }
 
         ul.sub {

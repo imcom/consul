@@ -2,12 +2,18 @@ package consul
 
 import (
 	"bytes"
-	"io/ioutil"
+	"fmt"
 	"os"
+	"reflect"
 	"testing"
 
+	"github.com/hashicorp/consul/consul/state"
 	"github.com/hashicorp/consul/consul/structs"
+	"github.com/hashicorp/consul/lib"
+	"github.com/hashicorp/consul/types"
+	"github.com/hashicorp/go-uuid"
 	"github.com/hashicorp/raft"
+	"time"
 )
 
 type MockSink struct {
@@ -37,16 +43,19 @@ func makeLog(buf []byte) *raft.Log {
 	}
 }
 
+func generateUUID() (ret string) {
+	var err error
+	if ret, err = uuid.GenerateUUID(); err != nil {
+		panic(fmt.Sprintf("Unable to generate a UUID, %v", err))
+	}
+	return ret
+}
+
 func TestFSM_RegisterNode(t *testing.T) {
-	path, err := ioutil.TempDir("", "fsm")
+	fsm, err := NewFSM(nil, os.Stderr)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	fsm, err := NewFSM(path, os.Stderr)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	defer fsm.Close()
 
 	req := structs.RegisterRequest{
 		Datacenter: "dc1",
@@ -64,29 +73,32 @@ func TestFSM_RegisterNode(t *testing.T) {
 	}
 
 	// Verify we are registered
-	if idx, found, _ := fsm.state.GetNode("foo"); !found {
+	_, node, err := fsm.state.GetNode("foo")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if node == nil {
 		t.Fatalf("not found!")
-	} else if idx != 1 {
-		t.Fatalf("bad index: %d", idx)
+	}
+	if node.ModifyIndex != 1 {
+		t.Fatalf("bad index: %d", node.ModifyIndex)
 	}
 
 	// Verify service registered
-	_, services := fsm.state.NodeServices("foo")
+	_, services, err := fsm.state.NodeServices(nil, "foo")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
 	if len(services.Services) != 0 {
 		t.Fatalf("Services: %v", services)
 	}
 }
 
 func TestFSM_RegisterNode_Service(t *testing.T) {
-	path, err := ioutil.TempDir("", "fsm")
+	fsm, err := NewFSM(nil, os.Stderr)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	fsm, err := NewFSM(path, os.Stderr)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	defer fsm.Close()
 
 	req := structs.RegisterRequest{
 		Datacenter: "dc1",
@@ -117,33 +129,38 @@ func TestFSM_RegisterNode_Service(t *testing.T) {
 	}
 
 	// Verify we are registered
-	if _, found, _ := fsm.state.GetNode("foo"); !found {
+	_, node, err := fsm.state.GetNode("foo")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if node == nil {
 		t.Fatalf("not found!")
 	}
 
 	// Verify service registered
-	_, services := fsm.state.NodeServices("foo")
+	_, services, err := fsm.state.NodeServices(nil, "foo")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
 	if _, ok := services.Services["db"]; !ok {
 		t.Fatalf("not registered!")
 	}
 
 	// Verify check
-	_, checks := fsm.state.NodeChecks("foo")
+	_, checks, err := fsm.state.NodeChecks(nil, "foo")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
 	if checks[0].CheckID != "db" {
 		t.Fatalf("not registered!")
 	}
 }
 
 func TestFSM_DeregisterService(t *testing.T) {
-	path, err := ioutil.TempDir("", "fsm")
+	fsm, err := NewFSM(nil, os.Stderr)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	fsm, err := NewFSM(path, os.Stderr)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	defer fsm.Close()
 
 	req := structs.RegisterRequest{
 		Datacenter: "dc1",
@@ -182,27 +199,29 @@ func TestFSM_DeregisterService(t *testing.T) {
 	}
 
 	// Verify we are registered
-	if _, found, _ := fsm.state.GetNode("foo"); !found {
+	_, node, err := fsm.state.GetNode("foo")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if node == nil {
 		t.Fatalf("not found!")
 	}
 
 	// Verify service not registered
-	_, services := fsm.state.NodeServices("foo")
+	_, services, err := fsm.state.NodeServices(nil, "foo")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
 	if _, ok := services.Services["db"]; ok {
 		t.Fatalf("db registered!")
 	}
 }
 
 func TestFSM_DeregisterCheck(t *testing.T) {
-	path, err := ioutil.TempDir("", "fsm")
+	fsm, err := NewFSM(nil, os.Stderr)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	fsm, err := NewFSM(path, os.Stderr)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	defer fsm.Close()
 
 	req := structs.RegisterRequest{
 		Datacenter: "dc1",
@@ -241,27 +260,29 @@ func TestFSM_DeregisterCheck(t *testing.T) {
 	}
 
 	// Verify we are registered
-	if _, found, _ := fsm.state.GetNode("foo"); !found {
+	_, node, err := fsm.state.GetNode("foo")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if node == nil {
 		t.Fatalf("not found!")
 	}
 
 	// Verify check not registered
-	_, checks := fsm.state.NodeChecks("foo")
+	_, checks, err := fsm.state.NodeChecks(nil, "foo")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
 	if len(checks) != 0 {
 		t.Fatalf("check registered!")
 	}
 }
 
 func TestFSM_DeregisterNode(t *testing.T) {
-	path, err := ioutil.TempDir("", "fsm")
+	fsm, err := NewFSM(nil, os.Stderr)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	fsm, err := NewFSM(path, os.Stderr)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	defer fsm.Close()
 
 	req := structs.RegisterRequest{
 		Datacenter: "dc1",
@@ -305,42 +326,47 @@ func TestFSM_DeregisterNode(t *testing.T) {
 		t.Fatalf("resp: %v", resp)
 	}
 
-	// Verify we are registered
-	if _, found, _ := fsm.state.GetNode("foo"); found {
+	// Verify we are not registered
+	_, node, err := fsm.state.GetNode("foo")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if node != nil {
 		t.Fatalf("found!")
 	}
 
 	// Verify service not registered
-	_, services := fsm.state.NodeServices("foo")
+	_, services, err := fsm.state.NodeServices(nil, "foo")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
 	if services != nil {
 		t.Fatalf("Services: %v", services)
 	}
 
 	// Verify checks not registered
-	_, checks := fsm.state.NodeChecks("foo")
+	_, checks, err := fsm.state.NodeChecks(nil, "foo")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
 	if len(checks) != 0 {
 		t.Fatalf("Services: %v", services)
 	}
 }
 
 func TestFSM_SnapshotRestore(t *testing.T) {
-	path, err := ioutil.TempDir("", "fsm")
+	fsm, err := NewFSM(nil, os.Stderr)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	fsm, err := NewFSM(path, os.Stderr)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	defer fsm.Close()
 
 	// Add some state
-	fsm.state.EnsureNode(1, structs.Node{"foo", "127.0.0.1"})
-	fsm.state.EnsureNode(2, structs.Node{"baz", "127.0.0.2"})
-	fsm.state.EnsureService(3, "foo", &structs.NodeService{"web", "web", nil, 80})
-	fsm.state.EnsureService(4, "foo", &structs.NodeService{"db", "db", []string{"primary"}, 5000})
-	fsm.state.EnsureService(5, "baz", &structs.NodeService{"web", "web", nil, 80})
-	fsm.state.EnsureService(6, "baz", &structs.NodeService{"db", "db", []string{"secondary"}, 5000})
+	fsm.state.EnsureNode(1, &structs.Node{Node: "foo", Address: "127.0.0.1"})
+	fsm.state.EnsureNode(2, &structs.Node{Node: "baz", Address: "127.0.0.2", TaggedAddresses: map[string]string{"hello": "1.2.3.4"}})
+	fsm.state.EnsureService(3, "foo", &structs.NodeService{ID: "web", Service: "web", Tags: nil, Address: "127.0.0.1", Port: 80})
+	fsm.state.EnsureService(4, "foo", &structs.NodeService{ID: "db", Service: "db", Tags: []string{"primary"}, Address: "127.0.0.1", Port: 5000})
+	fsm.state.EnsureService(5, "baz", &structs.NodeService{ID: "web", Service: "web", Tags: nil, Address: "127.0.0.2", Port: 80})
+	fsm.state.EnsureService(6, "baz", &structs.NodeService{ID: "db", Service: "db", Tags: []string{"secondary"}, Address: "127.0.0.2", Port: 5000})
 	fsm.state.EnsureCheck(7, &structs.HealthCheck{
 		Node:      "foo",
 		CheckID:   "web",
@@ -357,6 +383,56 @@ func TestFSM_SnapshotRestore(t *testing.T) {
 	acl := &structs.ACL{ID: generateUUID(), Name: "User Token"}
 	fsm.state.ACLSet(10, acl)
 
+	fsm.state.KVSSet(11, &structs.DirEntry{
+		Key:   "/remove",
+		Value: []byte("foo"),
+	})
+	fsm.state.KVSDelete(12, "/remove")
+	idx, _, err := fsm.state.KVSList(nil, "/remove")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if idx != 12 {
+		t.Fatalf("bad index: %d", idx)
+	}
+
+	updates := structs.Coordinates{
+		&structs.Coordinate{
+			Node:  "baz",
+			Coord: generateRandomCoordinate(),
+		},
+		&structs.Coordinate{
+			Node:  "foo",
+			Coord: generateRandomCoordinate(),
+		},
+	}
+	if err := fsm.state.CoordinateBatchUpdate(13, updates); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	query := structs.PreparedQuery{
+		ID: generateUUID(),
+		Service: structs.ServiceQuery{
+			Service: "web",
+		},
+		RaftIndex: structs.RaftIndex{
+			CreateIndex: 14,
+			ModifyIndex: 14,
+		},
+	}
+	if err := fsm.state.PreparedQuerySet(14, &query); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	autopilotConf := &structs.AutopilotConfig{
+		CleanupDeadServers:   true,
+		LastContactThreshold: 100 * time.Millisecond,
+		MaxTrailingLogs:      222,
+	}
+	if err := fsm.state.AutopilotSetConfig(15, autopilotConf); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
 	// Snapshot
 	snap, err := fsm.Snapshot()
 	if err != nil {
@@ -372,11 +448,10 @@ func TestFSM_SnapshotRestore(t *testing.T) {
 	}
 
 	// Try to restore on a new FSM
-	fsm2, err := NewFSM(path, os.Stderr)
+	fsm2, err := NewFSM(nil, os.Stderr)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	defer fsm2.Close()
 
 	// Do a restore
 	if err := fsm2.Restore(sink); err != nil {
@@ -384,29 +459,49 @@ func TestFSM_SnapshotRestore(t *testing.T) {
 	}
 
 	// Verify the contents
-	_, nodes := fsm2.state.Nodes()
+	_, nodes, err := fsm2.state.Nodes(nil)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
 	if len(nodes) != 2 {
-		t.Fatalf("Bad: %v", nodes)
+		t.Fatalf("bad: %v", nodes)
+	}
+	if nodes[0].Node != "baz" ||
+		nodes[0].Address != "127.0.0.2" ||
+		len(nodes[0].TaggedAddresses) != 1 ||
+		nodes[0].TaggedAddresses["hello"] != "1.2.3.4" {
+		t.Fatalf("bad: %v", nodes[0])
+	}
+	if nodes[1].Node != "foo" ||
+		nodes[1].Address != "127.0.0.1" ||
+		len(nodes[1].TaggedAddresses) != 0 {
+		t.Fatalf("bad: %v", nodes[1])
 	}
 
-	_, fooSrv := fsm2.state.NodeServices("foo")
+	_, fooSrv, err := fsm2.state.NodeServices(nil, "foo")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
 	if len(fooSrv.Services) != 2 {
 		t.Fatalf("Bad: %v", fooSrv)
 	}
-	if !strContains(fooSrv.Services["db"].Tags, "primary") {
+	if !lib.StrContains(fooSrv.Services["db"].Tags, "primary") {
 		t.Fatalf("Bad: %v", fooSrv)
 	}
 	if fooSrv.Services["db"].Port != 5000 {
 		t.Fatalf("Bad: %v", fooSrv)
 	}
 
-	_, checks := fsm2.state.NodeChecks("foo")
+	_, checks, err := fsm2.state.NodeChecks(nil, "foo")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
 	if len(checks) != 1 {
 		t.Fatalf("Bad: %v", checks)
 	}
 
 	// Verify key is set
-	_, d, err := fsm.state.KVSGet("/test")
+	_, d, err := fsm2.state.KVSGet(nil, "/test")
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -414,17 +509,8 @@ func TestFSM_SnapshotRestore(t *testing.T) {
 		t.Fatalf("bad: %v", d)
 	}
 
-	// Verify the index is restored
-	idx, _, err := fsm.state.KVSListKeys("/blah", "")
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if idx <= 1 {
-		t.Fatalf("bad index: %d", idx)
-	}
-
 	// Verify session is restored
-	idx, s, err := fsm.state.SessionGet(session.ID)
+	idx, s, err := fsm2.state.SessionGet(nil, session.ID)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -436,67 +522,138 @@ func TestFSM_SnapshotRestore(t *testing.T) {
 	}
 
 	// Verify ACL is restored
-	idx, a, err := fsm.state.ACLGet(acl.ID)
+	_, a, err := fsm2.state.ACLGet(nil, acl.ID)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
 	if a.Name != "User Token" {
 		t.Fatalf("bad: %v", a)
 	}
-	if idx <= 1 {
+	if a.ModifyIndex <= 1 {
 		t.Fatalf("bad index: %d", idx)
 	}
+
+	// Verify tombstones are restored
+	func() {
+		snap := fsm2.state.Snapshot()
+		defer snap.Close()
+		stones, err := snap.Tombstones()
+		if err != nil {
+			t.Fatalf("err: %s", err)
+		}
+		stone := stones.Next().(*state.Tombstone)
+		if stone == nil {
+			t.Fatalf("missing tombstone")
+		}
+		if stone.Key != "/remove" || stone.Index != 12 {
+			t.Fatalf("bad: %v", stone)
+		}
+		if stones.Next() != nil {
+			t.Fatalf("unexpected extra tombstones")
+		}
+	}()
+
+	// Verify coordinates are restored
+	_, coords, err := fsm2.state.Coordinates(nil)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if !reflect.DeepEqual(coords, updates) {
+		t.Fatalf("bad: %#v", coords)
+	}
+
+	// Verify queries are restored.
+	_, queries, err := fsm2.state.PreparedQueryList(nil)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if len(queries) != 1 {
+		t.Fatalf("bad: %#v", queries)
+	}
+	if !reflect.DeepEqual(queries[0], &query) {
+		t.Fatalf("bad: %#v", queries[0])
+	}
+
+	// Verify autopilot config is restored.
+	_, restoredConf, err := fsm2.state.AutopilotConfig()
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if !reflect.DeepEqual(restoredConf, autopilotConf) {
+		t.Fatalf("bad: %#v, %#v", restoredConf, autopilotConf)
+	}
+
+	// Snapshot
+	snap, err = fsm2.Snapshot()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	defer snap.Release()
+
+	// Persist
+	buf = bytes.NewBuffer(nil)
+	sink = &MockSink{buf, false}
+	if err := snap.Persist(sink); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Try to restore on the old FSM and make sure it abandons the old state
+	// store.
+	abandonCh := fsm.state.AbandonCh()
+	if err := fsm.Restore(sink); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	select {
+	case <-abandonCh:
+	default:
+		t.Fatalf("bad")
+	}
+
 }
 
-func TestFSM_KVSSet(t *testing.T) {
-	path, err := ioutil.TempDir("", "fsm")
+func TestFSM_BadRestore(t *testing.T) {
+	// Create an FSM with some state.
+	fsm, err := NewFSM(nil, os.Stderr)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	fsm, err := NewFSM(path, os.Stderr)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	defer fsm.Close()
+	fsm.state.EnsureNode(1, &structs.Node{Node: "foo", Address: "127.0.0.1"})
+	abandonCh := fsm.state.AbandonCh()
 
-	req := structs.KVSRequest{
-		Datacenter: "dc1",
-		Op:         structs.KVSSet,
-		DirEnt: structs.DirEntry{
-			Key:   "/test/path",
-			Flags: 0,
-			Value: []byte("test"),
-		},
-	}
-	buf, err := structs.Encode(structs.KVSRequestType, req)
-	if err != nil {
+	// Do a bad restore.
+	buf := bytes.NewBuffer([]byte("bad snapshot"))
+	sink := &MockSink{buf, false}
+	if err := fsm.Restore(sink); err == nil {
 		t.Fatalf("err: %v", err)
-	}
-	resp := fsm.Apply(makeLog(buf))
-	if resp != nil {
-		t.Fatalf("resp: %v", resp)
 	}
 
-	// Verify key is set
-	_, d, err := fsm.state.KVSGet("/test/path")
+	// Verify the contents didn't get corrupted.
+	_, nodes, err := fsm.state.Nodes(nil)
 	if err != nil {
-		t.Fatalf("err: %v", err)
+		t.Fatalf("err: %s", err)
 	}
-	if d == nil {
-		t.Fatalf("missing")
+	if len(nodes) != 1 {
+		t.Fatalf("bad: %v", nodes)
+	}
+	if nodes[0].Node != "foo" ||
+		nodes[0].Address != "127.0.0.1" ||
+		len(nodes[0].TaggedAddresses) != 0 {
+		t.Fatalf("bad: %v", nodes[0])
+	}
+
+	// Verify the old state store didn't get abandoned.
+	select {
+	case <-abandonCh:
+		t.Fatalf("bad")
+	default:
 	}
 }
 
 func TestFSM_KVSDelete(t *testing.T) {
-	path, err := ioutil.TempDir("", "fsm")
+	fsm, err := NewFSM(nil, os.Stderr)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	fsm, err := NewFSM(path, os.Stderr)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	defer fsm.Close()
 
 	req := structs.KVSRequest{
 		Datacenter: "dc1",
@@ -528,7 +685,7 @@ func TestFSM_KVSDelete(t *testing.T) {
 	}
 
 	// Verify key is not set
-	_, d, err := fsm.state.KVSGet("/test/path")
+	_, d, err := fsm.state.KVSGet(nil, "/test/path")
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -538,15 +695,10 @@ func TestFSM_KVSDelete(t *testing.T) {
 }
 
 func TestFSM_KVSDeleteTree(t *testing.T) {
-	path, err := ioutil.TempDir("", "fsm")
+	fsm, err := NewFSM(nil, os.Stderr)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	fsm, err := NewFSM(path, os.Stderr)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	defer fsm.Close()
 
 	req := structs.KVSRequest{
 		Datacenter: "dc1",
@@ -579,7 +731,7 @@ func TestFSM_KVSDeleteTree(t *testing.T) {
 	}
 
 	// Verify key is not set
-	_, d, err := fsm.state.KVSGet("/test/path")
+	_, d, err := fsm.state.KVSGet(nil, "/test/path")
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -588,16 +740,11 @@ func TestFSM_KVSDeleteTree(t *testing.T) {
 	}
 }
 
-func TestFSM_KVSCheckAndSet(t *testing.T) {
-	path, err := ioutil.TempDir("", "fsm")
+func TestFSM_KVSDeleteCheckAndSet(t *testing.T) {
+	fsm, err := NewFSM(nil, os.Stderr)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	fsm, err := NewFSM(path, os.Stderr)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	defer fsm.Close()
 
 	req := structs.KVSRequest{
 		Datacenter: "dc1",
@@ -618,7 +765,62 @@ func TestFSM_KVSCheckAndSet(t *testing.T) {
 	}
 
 	// Verify key is set
-	_, d, err := fsm.state.KVSGet("/test/path")
+	_, d, err := fsm.state.KVSGet(nil, "/test/path")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if d == nil {
+		t.Fatalf("key missing")
+	}
+
+	// Run the check-and-set
+	req.Op = structs.KVSDeleteCAS
+	req.DirEnt.ModifyIndex = d.ModifyIndex
+	buf, err = structs.Encode(structs.KVSRequestType, req)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	resp = fsm.Apply(makeLog(buf))
+	if resp.(bool) != true {
+		t.Fatalf("resp: %v", resp)
+	}
+
+	// Verify key is gone
+	_, d, err = fsm.state.KVSGet(nil, "/test/path")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if d != nil {
+		t.Fatalf("bad: %v", d)
+	}
+}
+
+func TestFSM_KVSCheckAndSet(t *testing.T) {
+	fsm, err := NewFSM(nil, os.Stderr)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	req := structs.KVSRequest{
+		Datacenter: "dc1",
+		Op:         structs.KVSSet,
+		DirEnt: structs.DirEntry{
+			Key:   "/test/path",
+			Flags: 0,
+			Value: []byte("test"),
+		},
+	}
+	buf, err := structs.Encode(structs.KVSRequestType, req)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	resp := fsm.Apply(makeLog(buf))
+	if resp != nil {
+		t.Fatalf("resp: %v", resp)
+	}
+
+	// Verify key is set
+	_, d, err := fsm.state.KVSGet(nil, "/test/path")
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -640,7 +842,7 @@ func TestFSM_KVSCheckAndSet(t *testing.T) {
 	}
 
 	// Verify key is updated
-	_, d, err = fsm.state.KVSGet("/test/path")
+	_, d, err = fsm.state.KVSGet(nil, "/test/path")
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -649,18 +851,53 @@ func TestFSM_KVSCheckAndSet(t *testing.T) {
 	}
 }
 
-func TestFSM_SessionCreate_Destroy(t *testing.T) {
-	path, err := ioutil.TempDir("", "fsm")
+func TestFSM_CoordinateUpdate(t *testing.T) {
+	fsm, err := NewFSM(nil, os.Stderr)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	fsm, err := NewFSM(path, os.Stderr)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	defer fsm.Close()
 
-	fsm.state.EnsureNode(1, structs.Node{"foo", "127.0.0.1"})
+	// Register some nodes.
+	fsm.state.EnsureNode(1, &structs.Node{Node: "node1", Address: "127.0.0.1"})
+	fsm.state.EnsureNode(2, &structs.Node{Node: "node2", Address: "127.0.0.1"})
+
+	// Write a batch of two coordinates.
+	updates := structs.Coordinates{
+		&structs.Coordinate{
+			Node:  "node1",
+			Coord: generateRandomCoordinate(),
+		},
+		&structs.Coordinate{
+			Node:  "node2",
+			Coord: generateRandomCoordinate(),
+		},
+	}
+	buf, err := structs.Encode(structs.CoordinateBatchUpdateType, updates)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	resp := fsm.Apply(makeLog(buf))
+	if resp != nil {
+		t.Fatalf("resp: %v", resp)
+	}
+
+	// Read back the two coordinates to make sure they got updated.
+	_, coords, err := fsm.state.Coordinates(nil)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if !reflect.DeepEqual(coords, updates) {
+		t.Fatalf("bad: %#v", coords)
+	}
+}
+
+func TestFSM_SessionCreate_Destroy(t *testing.T) {
+	fsm, err := NewFSM(nil, os.Stderr)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	fsm.state.EnsureNode(1, &structs.Node{Node: "foo", Address: "127.0.0.1"})
 	fsm.state.EnsureCheck(2, &structs.HealthCheck{
 		Node:    "foo",
 		CheckID: "web",
@@ -674,7 +911,7 @@ func TestFSM_SessionCreate_Destroy(t *testing.T) {
 		Session: structs.Session{
 			ID:     generateUUID(),
 			Node:   "foo",
-			Checks: []string{"web"},
+			Checks: []types.CheckID{"web"},
 		},
 	}
 	buf, err := structs.Encode(structs.SessionRequestType, req)
@@ -688,7 +925,7 @@ func TestFSM_SessionCreate_Destroy(t *testing.T) {
 
 	// Get the session
 	id := resp.(string)
-	_, session, err := fsm.state.SessionGet(id)
+	_, session, err := fsm.state.SessionGet(nil, id)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -724,7 +961,7 @@ func TestFSM_SessionCreate_Destroy(t *testing.T) {
 		t.Fatalf("resp: %v", resp)
 	}
 
-	_, session, err = fsm.state.SessionGet(id)
+	_, session, err = fsm.state.SessionGet(nil, id)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -734,17 +971,12 @@ func TestFSM_SessionCreate_Destroy(t *testing.T) {
 }
 
 func TestFSM_KVSLock(t *testing.T) {
-	path, err := ioutil.TempDir("", "fsm")
+	fsm, err := NewFSM(nil, os.Stderr)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	fsm, err := NewFSM(path, os.Stderr)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	defer fsm.Close()
 
-	fsm.state.EnsureNode(1, structs.Node{"foo", "127.0.0.1"})
+	fsm.state.EnsureNode(1, &structs.Node{Node: "foo", Address: "127.0.0.1"})
 	session := &structs.Session{ID: generateUUID(), Node: "foo"}
 	fsm.state.SessionCreate(2, session)
 
@@ -767,7 +999,7 @@ func TestFSM_KVSLock(t *testing.T) {
 	}
 
 	// Verify key is locked
-	_, d, err := fsm.state.KVSGet("/test/path")
+	_, d, err := fsm.state.KVSGet(nil, "/test/path")
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -783,17 +1015,12 @@ func TestFSM_KVSLock(t *testing.T) {
 }
 
 func TestFSM_KVSUnlock(t *testing.T) {
-	path, err := ioutil.TempDir("", "fsm")
+	fsm, err := NewFSM(nil, os.Stderr)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	fsm, err := NewFSM(path, os.Stderr)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	defer fsm.Close()
 
-	fsm.state.EnsureNode(1, structs.Node{"foo", "127.0.0.1"})
+	fsm.state.EnsureNode(1, &structs.Node{Node: "foo", Address: "127.0.0.1"})
 	session := &structs.Session{ID: generateUUID(), Node: "foo"}
 	fsm.state.SessionCreate(2, session)
 
@@ -834,7 +1061,7 @@ func TestFSM_KVSUnlock(t *testing.T) {
 	}
 
 	// Verify key is unlocked
-	_, d, err := fsm.state.KVSGet("/test/path")
+	_, d, err := fsm.state.KVSGet(nil, "/test/path")
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -850,15 +1077,10 @@ func TestFSM_KVSUnlock(t *testing.T) {
 }
 
 func TestFSM_ACL_Set_Delete(t *testing.T) {
-	path, err := ioutil.TempDir("", "fsm")
+	fsm, err := NewFSM(nil, os.Stderr)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	fsm, err := NewFSM(path, os.Stderr)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	defer fsm.Close()
 
 	// Create a new ACL
 	req := structs.ACLRequest{
@@ -881,7 +1103,7 @@ func TestFSM_ACL_Set_Delete(t *testing.T) {
 
 	// Get the ACL
 	id := resp.(string)
-	_, acl, err := fsm.state.ACLGet(id)
+	_, acl, err := fsm.state.ACLGet(nil, id)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -917,11 +1139,281 @@ func TestFSM_ACL_Set_Delete(t *testing.T) {
 		t.Fatalf("resp: %v", resp)
 	}
 
-	_, acl, err = fsm.state.ACLGet(id)
+	_, acl, err = fsm.state.ACLGet(nil, id)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
 	if acl != nil {
 		t.Fatalf("should be destroyed")
+	}
+}
+
+func TestFSM_PreparedQuery_CRUD(t *testing.T) {
+	fsm, err := NewFSM(nil, os.Stderr)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Register a service to query on.
+	fsm.state.EnsureNode(1, &structs.Node{Node: "foo", Address: "127.0.0.1"})
+	fsm.state.EnsureService(2, "foo", &structs.NodeService{ID: "web", Service: "web", Tags: nil, Address: "127.0.0.1", Port: 80})
+
+	// Create a new query.
+	query := structs.PreparedQueryRequest{
+		Op: structs.PreparedQueryCreate,
+		Query: &structs.PreparedQuery{
+			ID: generateUUID(),
+			Service: structs.ServiceQuery{
+				Service: "web",
+			},
+		},
+	}
+	{
+		buf, err := structs.Encode(structs.PreparedQueryRequestType, query)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		resp := fsm.Apply(makeLog(buf))
+		if resp != nil {
+			t.Fatalf("resp: %v", resp)
+		}
+	}
+
+	// Verify it's in the state store.
+	{
+		_, actual, err := fsm.state.PreparedQueryGet(nil, query.Query.ID)
+		if err != nil {
+			t.Fatalf("err: %s", err)
+		}
+
+		actual.CreateIndex, actual.ModifyIndex = 0, 0
+		if !reflect.DeepEqual(actual, query.Query) {
+			t.Fatalf("bad: %v", actual)
+		}
+	}
+
+	// Make an update to the query.
+	query.Op = structs.PreparedQueryUpdate
+	query.Query.Name = "my-query"
+	{
+		buf, err := structs.Encode(structs.PreparedQueryRequestType, query)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		resp := fsm.Apply(makeLog(buf))
+		if resp != nil {
+			t.Fatalf("resp: %v", resp)
+		}
+	}
+
+	// Verify the update.
+	{
+		_, actual, err := fsm.state.PreparedQueryGet(nil, query.Query.ID)
+		if err != nil {
+			t.Fatalf("err: %s", err)
+		}
+
+		actual.CreateIndex, actual.ModifyIndex = 0, 0
+		if !reflect.DeepEqual(actual, query.Query) {
+			t.Fatalf("bad: %v", actual)
+		}
+	}
+
+	// Delete the query.
+	query.Op = structs.PreparedQueryDelete
+	{
+		buf, err := structs.Encode(structs.PreparedQueryRequestType, query)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		resp := fsm.Apply(makeLog(buf))
+		if resp != nil {
+			t.Fatalf("resp: %v", resp)
+		}
+	}
+
+	// Make sure it's gone.
+	{
+		_, actual, err := fsm.state.PreparedQueryGet(nil, query.Query.ID)
+		if err != nil {
+			t.Fatalf("err: %s", err)
+		}
+
+		if actual != nil {
+			t.Fatalf("bad: %v", actual)
+		}
+	}
+}
+
+func TestFSM_TombstoneReap(t *testing.T) {
+	fsm, err := NewFSM(nil, os.Stderr)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Create some tombstones
+	fsm.state.KVSSet(11, &structs.DirEntry{
+		Key:   "/remove",
+		Value: []byte("foo"),
+	})
+	fsm.state.KVSDelete(12, "/remove")
+	idx, _, err := fsm.state.KVSList(nil, "/remove")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if idx != 12 {
+		t.Fatalf("bad index: %d", idx)
+	}
+
+	// Create a new reap request
+	req := structs.TombstoneRequest{
+		Datacenter: "dc1",
+		Op:         structs.TombstoneReap,
+		ReapIndex:  12,
+	}
+	buf, err := structs.Encode(structs.TombstoneRequestType, req)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	resp := fsm.Apply(makeLog(buf))
+	if err, ok := resp.(error); ok {
+		t.Fatalf("resp: %v", err)
+	}
+
+	// Verify the tombstones are gone
+	snap := fsm.state.Snapshot()
+	defer snap.Close()
+	stones, err := snap.Tombstones()
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if stones.Next() != nil {
+		t.Fatalf("unexpected extra tombstones")
+	}
+}
+
+func TestFSM_Txn(t *testing.T) {
+	fsm, err := NewFSM(nil, os.Stderr)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Set a key using a transaction.
+	req := structs.TxnRequest{
+		Datacenter: "dc1",
+		Ops: structs.TxnOps{
+			&structs.TxnOp{
+				KV: &structs.TxnKVOp{
+					Verb: structs.KVSSet,
+					DirEnt: structs.DirEntry{
+						Key:   "/test/path",
+						Flags: 0,
+						Value: []byte("test"),
+					},
+				},
+			},
+		},
+	}
+	buf, err := structs.Encode(structs.TxnRequestType, req)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	resp := fsm.Apply(makeLog(buf))
+	if _, ok := resp.(structs.TxnResponse); !ok {
+		t.Fatalf("bad response type: %T", resp)
+	}
+
+	// Verify key is set directly in the state store.
+	_, d, err := fsm.state.KVSGet(nil, "/test/path")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if d == nil {
+		t.Fatalf("missing")
+	}
+}
+
+func TestFSM_Autopilot(t *testing.T) {
+	fsm, err := NewFSM(nil, os.Stderr)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Set the autopilot config using a request.
+	req := structs.AutopilotSetConfigRequest{
+		Datacenter: "dc1",
+		Config: structs.AutopilotConfig{
+			CleanupDeadServers:   true,
+			LastContactThreshold: 10 * time.Second,
+			MaxTrailingLogs:      300,
+		},
+	}
+	buf, err := structs.Encode(structs.AutopilotRequestType, req)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	resp := fsm.Apply(makeLog(buf))
+	if _, ok := resp.(error); ok {
+		t.Fatalf("bad: %v", resp)
+	}
+
+	// Verify key is set directly in the state store.
+	_, config, err := fsm.state.AutopilotConfig()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if config.CleanupDeadServers != req.Config.CleanupDeadServers {
+		t.Fatalf("bad: %v", config.CleanupDeadServers)
+	}
+	if config.LastContactThreshold != req.Config.LastContactThreshold {
+		t.Fatalf("bad: %v", config.LastContactThreshold)
+	}
+	if config.MaxTrailingLogs != req.Config.MaxTrailingLogs {
+		t.Fatalf("bad: %v", config.MaxTrailingLogs)
+	}
+
+	// Now use CAS and provide an old index
+	req.CAS = true
+	req.Config.CleanupDeadServers = false
+	req.Config.ModifyIndex = config.ModifyIndex - 1
+	buf, err = structs.Encode(structs.AutopilotRequestType, req)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	resp = fsm.Apply(makeLog(buf))
+	if _, ok := resp.(error); ok {
+		t.Fatalf("bad: %v", resp)
+	}
+
+	_, config, err = fsm.state.AutopilotConfig()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if !config.CleanupDeadServers {
+		t.Fatalf("bad: %v", config.CleanupDeadServers)
+	}
+}
+
+func TestFSM_IgnoreUnknown(t *testing.T) {
+	fsm, err := NewFSM(nil, os.Stderr)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Create a new reap request
+	type UnknownRequest struct {
+		Foo string
+	}
+	req := UnknownRequest{Foo: "bar"}
+	msgType := structs.IgnoreUnknownTypeFlag | 64
+	buf, err := structs.Encode(msgType, req)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Apply should work, even though not supported
+	resp := fsm.Apply(makeLog(buf))
+	if err, ok := resp.(error); ok {
+		t.Fatalf("resp: %v", err)
 	}
 }

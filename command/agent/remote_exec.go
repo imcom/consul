@@ -117,7 +117,7 @@ func (r *rexecWriter) Flush() {
 // handleRemoteExec is invoked when a new remote exec request is received
 func (a *Agent) handleRemoteExec(msg *UserEvent) {
 	a.logger.Printf("[DEBUG] agent: received remote exec event (ID: %s)", msg.ID)
-	// Decode the event paylaod
+	// Decode the event payload
 	var event remoteExecEvent
 	if err := json.Unmarshal(msg.Payload, &event); err != nil {
 		a.logger.Printf("[ERR] agent: failed to decode remote exec event: %v", err)
@@ -242,6 +242,7 @@ func (a *Agent) remoteExecGetSpec(event *remoteExecEvent, spec *remoteExecSpec) 
 			AllowStale: true, // Stale read for scale! Retry on failure.
 		},
 	}
+	get.Token = a.config.ACLToken
 	var out structs.IndexedDirEntries
 QUERY:
 	if err := a.RPC("KVS.Get", &get, &out); err != nil {
@@ -308,6 +309,7 @@ func (a *Agent) remoteExecWriteKey(event *remoteExecEvent, suffix string, val []
 			Session: event.Session,
 		},
 	}
+	write.Token = a.config.ACLToken
 	var success bool
 	if err := a.RPC("KVS.Apply", &write, &success); err != nil {
 		return err

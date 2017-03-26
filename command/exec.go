@@ -3,7 +3,6 @@ package command
 import (
 	"bytes"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -14,7 +13,8 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/armon/consul-api"
+	consulapi "github.com/hashicorp/consul/api"
+	"github.com/hashicorp/consul/command/base"
 	"github.com/mitchellh/cli"
 )
 
@@ -42,12 +42,22 @@ const (
 	// rExecQuietWait is how long we wait for no responses
 	// before assuming the job is done.
 	rExecQuietWait = 2 * time.Second
+
+	// rExecTTL is how long we default the session TTL to
+	rExecTTL = "15s"
+
+	// rExecRenewInterval is how often we renew the session TTL
+	// when doing an exec in a foreign DC.
+	rExecRenewInterval = 5 * time.Second
 )
 
 // rExecConf is used to pass around configuration
 type rExecConf struct {
-	datacenter string
-	prefix     string
+	prefix string
+
+	foreignDC bool
+	localDC   string
+	localNode string
 
 	node    string
 	service string
@@ -106,31 +116,39 @@ type rExecExit struct {
 // ExecCommand is a Command implementation that is used to
 // do remote execution of commands
 type ExecCommand struct {
+	base.Command
+
 	ShutdownCh <-chan struct{}
-	Ui         cli.Ui
 	conf       rExecConf
 	client     *consulapi.Client
 	sessionID  string
+	stopCh     chan struct{}
 }
 
 func (c *ExecCommand) Run(args []string) int {
-	cmdFlags := flag.NewFlagSet("exec", flag.ContinueOnError)
-	cmdFlags.Usage = func() { c.Ui.Output(c.Help()) }
-	cmdFlags.StringVar(&c.conf.datacenter, "datacenter", "", "")
-	cmdFlags.StringVar(&c.conf.node, "node", "", "")
-	cmdFlags.StringVar(&c.conf.service, "service", "", "")
-	cmdFlags.StringVar(&c.conf.tag, "tag", "", "")
-	cmdFlags.StringVar(&c.conf.prefix, "prefix", rExecPrefix, "")
-	cmdFlags.DurationVar(&c.conf.replWait, "wait-repl", rExecReplicationWait, "")
-	cmdFlags.DurationVar(&c.conf.wait, "wait", rExecQuietWait, "")
-	cmdFlags.BoolVar(&c.conf.verbose, "verbose", false, "")
-	httpAddr := HTTPAddrFlag(cmdFlags)
-	if err := cmdFlags.Parse(args); err != nil {
+	f := c.Command.NewFlagSet(c)
+	f.StringVar(&c.conf.node, "node", "",
+		"Regular expression to filter on node names.")
+	f.StringVar(&c.conf.service, "service", "",
+		"Regular expression to filter on service instances.")
+	f.StringVar(&c.conf.tag, "tag", "",
+		"Regular expression to filter on service tags. Must be used with -service.")
+	f.StringVar(&c.conf.prefix, "prefix", rExecPrefix,
+		"Prefix in the KV store to use for request data.")
+	f.DurationVar(&c.conf.wait, "wait", rExecQuietWait,
+		"Period to wait with no responses before terminating execution.")
+	f.DurationVar(&c.conf.replWait, "wait-repl", rExecReplicationWait,
+		"Period to wait for replication before firing event. This is an "+
+			"optimization to allow stale reads to be performed.")
+	f.BoolVar(&c.conf.verbose, "verbose", false,
+		"Enables verbose output.")
+
+	if err := c.Command.Parse(args); err != nil {
 		return 1
 	}
 
 	// Join the commands to execute
-	c.conf.cmd = strings.Join(cmdFlags.Args(), " ")
+	c.conf.cmd = strings.Join(f.Args(), " ")
 
 	// If there is no command, read stdin for a script input
 	if c.conf.cmd == "-" {
@@ -161,17 +179,27 @@ func (c *ExecCommand) Run(args []string) int {
 	}
 
 	// Create and test the HTTP client
-	client, err := HTTPClientDC(*httpAddr, c.conf.datacenter)
+	client, err := c.Command.HTTPClient()
 	if err != nil {
 		c.Ui.Error(fmt.Sprintf("Error connecting to Consul agent: %s", err))
 		return 1
 	}
-	_, err = client.Agent().NodeName()
+	info, err := client.Agent().Self()
 	if err != nil {
 		c.Ui.Error(fmt.Sprintf("Error querying Consul agent: %s", err))
 		return 1
 	}
 	c.client = client
+
+	// Check if this is a foreign datacenter
+	if c.Command.HTTPDatacenter() != "" && c.Command.HTTPDatacenter() != info["Config"]["Datacenter"] {
+		if c.conf.verbose {
+			c.Ui.Info("Remote exec in foreign datacenter, using Session TTL")
+		}
+		c.conf.foreignDC = true
+		c.conf.localDC = info["Config"]["Datacenter"].(string)
+		c.conf.localNode = info["Config"]["NodeName"].(string)
+	}
 
 	// Create the job spec
 	spec, err := c.makeRExecSpec()
@@ -240,7 +268,7 @@ func (c *ExecCommand) waitForJob() int {
 	errCh := make(chan struct{}, 1)
 	defer close(doneCh)
 	go c.streamResults(doneCh, ackCh, heartCh, outputCh, exitCh, errCh)
-	target := &TargettedUi{Ui: c.Ui}
+	target := &TargetedUi{Ui: c.Ui}
 
 	var ackCount, exitCount, badExit int
 OUTER:
@@ -351,7 +379,7 @@ func (c *ExecCommand) streamResults(doneCh chan struct{}, ackCh chan rExecAck, h
 
 			case strings.HasSuffix(key, rExecExitSuffix):
 				pair, _, err := kv.Get(full, nil)
-				if err != nil {
+				if err != nil || pair == nil {
 					c.Ui.Error(fmt.Sprintf("Failed to read key '%s': %v", full, err))
 					continue
 				}
@@ -367,7 +395,7 @@ func (c *ExecCommand) streamResults(doneCh chan struct{}, ackCh chan rExecAck, h
 
 			case strings.LastIndex(key, rExecOutputDivider) != -1:
 				pair, _, err := kv.Get(full, nil)
-				if err != nil {
+				if err != nil || pair == nil {
 					c.Ui.Error(fmt.Sprintf("Failed to read key '%s': %v", full, err))
 					continue
 				}
@@ -418,16 +446,92 @@ func (conf *rExecConf) validate() error {
 
 // createSession is used to create a new session for this command
 func (c *ExecCommand) createSession() (string, error) {
+	var id string
+	var err error
+	if c.conf.foreignDC {
+		id, err = c.createSessionForeign()
+	} else {
+		id, err = c.createSessionLocal()
+	}
+	if err == nil {
+		c.stopCh = make(chan struct{})
+		go c.renewSession(id, c.stopCh)
+	}
+	return id, err
+}
+
+// createSessionLocal is used to create a new session in a local datacenter
+// This is simpler since we can use the local agent to create the session.
+func (c *ExecCommand) createSessionLocal() (string, error) {
 	session := c.client.Session()
 	se := consulapi.SessionEntry{
-		Name: "Remote Exec",
+		Name:     "Remote Exec",
+		Behavior: consulapi.SessionBehaviorDelete,
+		TTL:      rExecTTL,
 	}
 	id, _, err := session.Create(&se, nil)
 	return id, err
 }
 
+// createSessionLocal is used to create a new session in a foreign datacenter
+// This is more complex since the local agent cannot be used to create
+// a session, and we must associate with a node in the remote datacenter.
+func (c *ExecCommand) createSessionForeign() (string, error) {
+	// Look for a remote node to bind to
+	health := c.client.Health()
+	services, _, err := health.Service("consul", "", true, nil)
+	if err != nil {
+		return "", fmt.Errorf("Failed to find Consul server in remote datacenter: %v", err)
+	}
+	if len(services) == 0 {
+		return "", fmt.Errorf("Failed to find Consul server in remote datacenter")
+	}
+	node := services[0].Node.Node
+	if c.conf.verbose {
+		c.Ui.Info(fmt.Sprintf("Binding session to remote node %s@%s",
+			node, c.Command.HTTPDatacenter()))
+	}
+
+	session := c.client.Session()
+	se := consulapi.SessionEntry{
+		Name:     fmt.Sprintf("Remote Exec via %s@%s", c.conf.localNode, c.conf.localDC),
+		Node:     node,
+		Checks:   []string{},
+		Behavior: consulapi.SessionBehaviorDelete,
+		TTL:      rExecTTL,
+	}
+	id, _, err := session.CreateNoChecks(&se, nil)
+	return id, err
+}
+
+// renewSession is a long running routine that periodically renews
+// the session TTL. This is used for foreign sessions where we depend
+// on TTLs.
+func (c *ExecCommand) renewSession(id string, stopCh chan struct{}) {
+	session := c.client.Session()
+	for {
+		select {
+		case <-time.After(rExecRenewInterval):
+			_, _, err := session.Renew(id, nil)
+			if err != nil {
+				c.Ui.Error(fmt.Sprintf("Session renew failed: %v", err))
+				return
+			}
+		case <-stopCh:
+			return
+		}
+	}
+}
+
 // destroySession is used to destroy the associated session
 func (c *ExecCommand) destroySession() error {
+	// Stop the session renew if any
+	if c.stopCh != nil {
+		close(c.stopCh)
+		c.stopCh = nil
+	}
+
+	// Destroy the session explicitly
 	session := c.client.Session()
 	_, err := session.Destroy(c.sessionID, nil)
 	return err
@@ -514,50 +618,38 @@ Usage: consul exec [options] [-|command...]
   definitions. If a command is '-', stdin will be read until EOF
   and used as a script input.
 
-Options:
+` + c.Command.Help()
 
-  -http-addr=127.0.0.1:8500  HTTP address of the Consul agent.
-  -datacenter=""             Datacenter to dispatch in. Defaults to that of agent.
-  -prefix="_rexec"           Prefix in the KV store to use for request data
-  -node=""					 Regular expression to filter on node names
-  -service=""                Regular expression to filter on service instances
-  -tag=""                    Regular expression to filter on service tags. Must be used
-                             with -service.
-  -wait=2s                   Period to wait with no responses before terminating execution.
-  -wait-repl=200ms           Period to wait for replication before firing event. This is an
-                             optimization to allow stale reads to be performed.
-  -verbose                   Enables verbose output
-`
 	return strings.TrimSpace(helpText)
 }
 
-// TargettedUi is a UI that wraps another UI implementation and modifies
+// TargetedUi is a UI that wraps another UI implementation and modifies
 // the output to indicate a specific target. Specifically, all Say output
 // is prefixed with the target name. Message output is not prefixed but
 // is offset by the length of the target so that output is lined up properly
 // with Say output. Machine-readable output has the proper target set.
-type TargettedUi struct {
+type TargetedUi struct {
 	Target string
 	Ui     cli.Ui
 }
 
-func (u *TargettedUi) Ask(query string) (string, error) {
+func (u *TargetedUi) Ask(query string) (string, error) {
 	return u.Ui.Ask(u.prefixLines(true, query))
 }
 
-func (u *TargettedUi) Info(message string) {
+func (u *TargetedUi) Info(message string) {
 	u.Ui.Info(u.prefixLines(true, message))
 }
 
-func (u *TargettedUi) Output(message string) {
+func (u *TargetedUi) Output(message string) {
 	u.Ui.Output(u.prefixLines(false, message))
 }
 
-func (u *TargettedUi) Error(message string) {
+func (u *TargetedUi) Error(message string) {
 	u.Ui.Error(u.prefixLines(true, message))
 }
 
-func (u *TargettedUi) prefixLines(arrow bool, message string) string {
+func (u *TargetedUi) prefixLines(arrow bool, message string) string {
 	arrowText := "==>"
 	if !arrow {
 		arrowText = strings.Repeat(" ", len(arrowText))

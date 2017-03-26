@@ -5,7 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/armon/consul-api"
+	consulapi "github.com/hashicorp/consul/api"
+	"github.com/hashicorp/consul/consul/structs"
 )
 
 var consulAddr string
@@ -299,7 +300,7 @@ func TestChecksWatch_State(t *testing.T) {
 				Node:    "foobar",
 				CheckID: "foobar",
 				Name:    "foobar",
-				Status:  "warning",
+				Status:  structs.HealthWarning,
 			},
 		}
 		catalog.Register(reg, nil)
@@ -363,7 +364,7 @@ func TestChecksWatch_Service(t *testing.T) {
 				Node:      "foobar",
 				CheckID:   "foobar",
 				Name:      "foobar",
-				Status:    "passing",
+				Status:    structs.HealthPassing,
 				ServiceID: "foobar",
 			},
 		}

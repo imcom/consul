@@ -2,11 +2,14 @@ package consul
 
 import (
 	"fmt"
-	"sort"
 	"time"
 
 	"github.com/armon/go-metrics"
+	"github.com/hashicorp/consul/consul/state"
 	"github.com/hashicorp/consul/consul/structs"
+	"github.com/hashicorp/consul/types"
+	"github.com/hashicorp/go-memdb"
+	"github.com/hashicorp/go-uuid"
 )
 
 // Catalog endpoint is used to manipulate the service catalog
@@ -21,51 +24,77 @@ func (c *Catalog) Register(args *structs.RegisterRequest, reply *struct{}) error
 	}
 	defer metrics.MeasureSince([]string{"consul", "catalog", "register"}, time.Now())
 
-	// Verify the args
+	// Verify the args.
 	if args.Node == "" || args.Address == "" {
 		return fmt.Errorf("Must provide node and address")
 	}
+	if args.ID != "" {
+		if _, err := uuid.ParseUUID(string(args.ID)); err != nil {
+			return fmt.Errorf("Bad node ID: %v", err)
+		}
+	}
 
+	// Fetch the ACL token, if any.
+	acl, err := c.srv.resolveToken(args.Token)
+	if err != nil {
+		return err
+	}
+
+	// Handle a service registration.
 	if args.Service != nil {
 		// If no service id, but service name, use default
 		if args.Service.ID == "" && args.Service.Service != "" {
 			args.Service.ID = args.Service.Service
 		}
 
-		// Verify ServiceName provided if ID
+		// Verify ServiceName provided if ID.
 		if args.Service.ID != "" && args.Service.Service == "" {
 			return fmt.Errorf("Must provide service name with ID")
 		}
 
-		// Apply the ACL policy if any
-		// The 'consul' service is excluded since it is managed
-		// automatically internally.
+		// Apply the ACL policy if any. The 'consul' service is excluded
+		// since it is managed automatically internally (that behavior
+		// is going away after version 0.8). We check this same policy
+		// later if version 0.8 is enabled, so we can eventually just
+		// delete this and do all the ACL checks down there.
 		if args.Service.Service != ConsulServiceName {
-			acl, err := c.srv.resolveToken(args.Token)
-			if err != nil {
-				return err
-			} else if acl != nil && !acl.ServiceWrite(args.Service.Service) {
-				c.srv.logger.Printf("[WARN] consul.catalog: Register of service '%s' on '%s' denied due to ACLs",
-					args.Service.Service, args.Node)
+			if acl != nil && !acl.ServiceWrite(args.Service.Service) {
 				return permissionDeniedErr
 			}
 		}
 	}
 
+	// Move the old format single check into the slice, and fixup IDs.
 	if args.Check != nil {
-		if args.Check.CheckID == "" && args.Check.Name != "" {
-			args.Check.CheckID = args.Check.Name
+		args.Checks = append(args.Checks, args.Check)
+		args.Check = nil
+	}
+	for _, check := range args.Checks {
+		if check.CheckID == "" && check.Name != "" {
+			check.CheckID = types.CheckID(check.Name)
 		}
-		if args.Check.Node == "" {
-			args.Check.Node = args.Node
+		if check.Node == "" {
+			check.Node = args.Node
 		}
 	}
 
-	_, err := c.srv.raftApply(structs.RegisterRequestType, args)
+	// Check the complete register request against the given ACL policy.
+	if acl != nil && c.srv.config.ACLEnforceVersion8 {
+		state := c.srv.fsm.State()
+		_, ns, err := state.NodeServices(nil, args.Node)
+		if err != nil {
+			return fmt.Errorf("Node lookup failed: %v", err)
+		}
+		if err := vetRegisterWithACL(acl, args, ns); err != nil {
+			return err
+		}
+	}
+
+	_, err = c.srv.raftApply(structs.RegisterRequestType, args)
 	if err != nil {
-		c.srv.logger.Printf("[ERR] consul.catalog: Register failed: %v", err)
 		return err
 	}
+
 	return nil
 }
 
@@ -81,9 +110,38 @@ func (c *Catalog) Deregister(args *structs.DeregisterRequest, reply *struct{}) e
 		return fmt.Errorf("Must provide node")
 	}
 
-	_, err := c.srv.raftApply(structs.DeregisterRequestType, args)
+	// Fetch the ACL token, if any.
+	acl, err := c.srv.resolveToken(args.Token)
 	if err != nil {
-		c.srv.logger.Printf("[ERR] consul.catalog: Deregister failed: %v", err)
+		return err
+	}
+
+	// Check the complete deregister request against the given ACL policy.
+	if acl != nil && c.srv.config.ACLEnforceVersion8 {
+		state := c.srv.fsm.State()
+
+		var ns *structs.NodeService
+		if args.ServiceID != "" {
+			_, ns, err = state.NodeService(args.Node, args.ServiceID)
+			if err != nil {
+				return fmt.Errorf("Service lookup failed: %v", err)
+			}
+		}
+
+		var nc *structs.HealthCheck
+		if args.CheckID != "" {
+			_, nc, err = state.NodeCheck(args.Node, args.CheckID)
+			if err != nil {
+				return fmt.Errorf("Check lookup failed: %v", err)
+			}
+		}
+
+		if err := vetDeregisterWithACL(acl, args, ns, nc); err != nil {
+			return err
+		}
+	}
+
+	if _, err := c.srv.raftApply(structs.DeregisterRequestType, args); err != nil {
 		return err
 	}
 	return nil
@@ -91,19 +149,11 @@ func (c *Catalog) Deregister(args *structs.DeregisterRequest, reply *struct{}) e
 
 // ListDatacenters is used to query for the list of known datacenters
 func (c *Catalog) ListDatacenters(args *struct{}, reply *[]string) error {
-	c.srv.remoteLock.RLock()
-	defer c.srv.remoteLock.RUnlock()
-
-	// Read the known DCs
-	var dcs []string
-	for dc := range c.srv.remoteConsuls {
-		dcs = append(dcs, dc)
+	dcs, err := c.srv.router.GetDatacentersByDistance()
+	if err != nil {
+		return err
 	}
 
-	// Sort the DCs
-	sort.Strings(dcs)
-
-	// Return
 	*reply = dcs
 	return nil
 }
@@ -114,14 +164,27 @@ func (c *Catalog) ListNodes(args *structs.DCSpecificRequest, reply *structs.Inde
 		return err
 	}
 
-	// Get the local state
-	state := c.srv.fsm.State()
-	return c.srv.blockingRPC(&args.QueryOptions,
+	return c.srv.blockingQuery(
+		&args.QueryOptions,
 		&reply.QueryMeta,
-		state.QueryTables("Nodes"),
-		func() error {
-			reply.Index, reply.Nodes = state.Nodes()
-			return nil
+		func(ws memdb.WatchSet, state *state.StateStore) error {
+			var index uint64
+			var nodes structs.Nodes
+			var err error
+			if len(args.NodeMetaFilters) > 0 {
+				index, nodes, err = state.NodesByMeta(ws, args.NodeMetaFilters)
+			} else {
+				index, nodes, err = state.Nodes(ws)
+			}
+			if err != nil {
+				return err
+			}
+
+			reply.Index, reply.Nodes = index, nodes
+			if err := c.srv.filterACL(args.Token, reply); err != nil {
+				return err
+			}
+			return c.srv.sortNodesByDistanceFrom(args.Source, reply.Nodes)
 		})
 }
 
@@ -131,14 +194,24 @@ func (c *Catalog) ListServices(args *structs.DCSpecificRequest, reply *structs.I
 		return err
 	}
 
-	// Get the current nodes
-	state := c.srv.fsm.State()
-	return c.srv.blockingRPC(&args.QueryOptions,
+	return c.srv.blockingQuery(
+		&args.QueryOptions,
 		&reply.QueryMeta,
-		state.QueryTables("Services"),
-		func() error {
-			reply.Index, reply.Services = state.Services()
-			return nil
+		func(ws memdb.WatchSet, state *state.StateStore) error {
+			var index uint64
+			var services structs.Services
+			var err error
+			if len(args.NodeMetaFilters) > 0 {
+				index, services, err = state.ServicesByNodeMeta(ws, args.NodeMetaFilters)
+			} else {
+				index, services, err = state.Services(ws)
+			}
+			if err != nil {
+				return err
+			}
+
+			reply.Index, reply.Services = index, services
+			return c.srv.filterACL(args.Token, reply)
 		})
 }
 
@@ -153,18 +226,35 @@ func (c *Catalog) ServiceNodes(args *structs.ServiceSpecificRequest, reply *stru
 		return fmt.Errorf("Must provide service name")
 	}
 
-	// Get the nodes
-	state := c.srv.fsm.State()
-	err := c.srv.blockingRPC(&args.QueryOptions,
+	err := c.srv.blockingQuery(
+		&args.QueryOptions,
 		&reply.QueryMeta,
-		state.QueryTables("ServiceNodes"),
-		func() error {
+		func(ws memdb.WatchSet, state *state.StateStore) error {
+			var index uint64
+			var services structs.ServiceNodes
+			var err error
 			if args.TagFilter {
-				reply.Index, reply.ServiceNodes = state.ServiceTagNodes(args.ServiceName, args.ServiceTag)
+				index, services, err = state.ServiceTagNodes(ws, args.ServiceName, args.ServiceTag)
 			} else {
-				reply.Index, reply.ServiceNodes = state.ServiceNodes(args.ServiceName)
+				index, services, err = state.ServiceNodes(ws, args.ServiceName)
 			}
-			return nil
+			if err != nil {
+				return err
+			}
+			reply.Index, reply.ServiceNodes = index, services
+			if len(args.NodeMetaFilters) > 0 {
+				var filtered structs.ServiceNodes
+				for _, service := range services {
+					if structs.SatisfiesMetaFilters(service.NodeMeta, args.NodeMetaFilters) {
+						filtered = append(filtered, service)
+					}
+				}
+				reply.ServiceNodes = filtered
+			}
+			if err := c.srv.filterACL(args.Token, reply); err != nil {
+				return err
+			}
+			return c.srv.sortNodesByDistanceFrom(args.Source, reply.ServiceNodes)
 		})
 
 	// Provide some metrics
@@ -191,13 +281,16 @@ func (c *Catalog) NodeServices(args *structs.NodeSpecificRequest, reply *structs
 		return fmt.Errorf("Must provide node")
 	}
 
-	// Get the node services
-	state := c.srv.fsm.State()
-	return c.srv.blockingRPC(&args.QueryOptions,
+	return c.srv.blockingQuery(
+		&args.QueryOptions,
 		&reply.QueryMeta,
-		state.QueryTables("NodeServices"),
-		func() error {
-			reply.Index, reply.NodeServices = state.NodeServices(args.Node)
-			return nil
+		func(ws memdb.WatchSet, state *state.StateStore) error {
+			index, services, err := state.NodeServices(ws, args.Node)
+			if err != nil {
+				return err
+			}
+
+			reply.Index, reply.NodeServices = index, services
+			return c.srv.filterACL(args.Token, reply)
 		})
 }

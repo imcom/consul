@@ -91,7 +91,7 @@ func (s *HTTPServer) KVSGet(resp http.ResponseWriter, req *http.Request, args *s
 
 // KVSGetKeys handles a GET request for keys
 func (s *HTTPServer) KVSGetKeys(resp http.ResponseWriter, req *http.Request, args *structs.KeyRequest) (interface{}, error) {
-	// Check for a seperator, due to historic spelling error,
+	// Check for a separator, due to historic spelling error,
 	// we now are forced to check for both spellings
 	var sep string
 	params := req.URL.Query()
@@ -134,6 +134,9 @@ func (s *HTTPServer) KVSGetKeys(resp http.ResponseWriter, req *http.Request, arg
 // KVSPut handles a PUT request
 func (s *HTTPServer) KVSPut(resp http.ResponseWriter, req *http.Request, args *structs.KeyRequest) (interface{}, error) {
 	if missingKey(resp, args) {
+		return nil, nil
+	}
+	if conflictingFlags(resp, req, "cas", "acquire", "release") {
 		return nil, nil
 	}
 	applyReq := structs.KVSRequest{
@@ -209,6 +212,9 @@ func (s *HTTPServer) KVSPut(resp http.ResponseWriter, req *http.Request, args *s
 
 // KVSPut handles a DELETE request
 func (s *HTTPServer) KVSDelete(resp http.ResponseWriter, req *http.Request, args *structs.KeyRequest) (interface{}, error) {
+	if conflictingFlags(resp, req, "recurse", "cas") {
+		return nil, nil
+	}
 	applyReq := structs.KVSRequest{
 		Datacenter: args.Datacenter,
 		Op:         structs.KVSDelete,
@@ -226,12 +232,28 @@ func (s *HTTPServer) KVSDelete(resp http.ResponseWriter, req *http.Request, args
 		return nil, nil
 	}
 
+	// Check for cas value
+	if _, ok := params["cas"]; ok {
+		casVal, err := strconv.ParseUint(params.Get("cas"), 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		applyReq.DirEnt.ModifyIndex = casVal
+		applyReq.Op = structs.KVSDeleteCAS
+	}
+
 	// Make the RPC
 	var out bool
 	if err := s.agent.RPC("KVS.Apply", &applyReq, &out); err != nil {
 		return nil, err
 	}
-	return nil, nil
+
+	// Only use the out value if this was a CAS
+	if applyReq.Op == structs.KVSDeleteCAS {
+		return out, nil
+	} else {
+		return true, nil
+	}
 }
 
 // missingKey checks if the key is missing
@@ -241,5 +263,24 @@ func missingKey(resp http.ResponseWriter, args *structs.KeyRequest) bool {
 		resp.Write([]byte("Missing key name"))
 		return true
 	}
+	return false
+}
+
+// conflictingFlags determines if non-composable flags were passed in a request.
+func conflictingFlags(resp http.ResponseWriter, req *http.Request, flags ...string) bool {
+	params := req.URL.Query()
+
+	found := false
+	for _, conflict := range flags {
+		if _, ok := params[conflict]; ok {
+			if found {
+				resp.WriteHeader(400)
+				resp.Write([]byte("Conflicting flags: " + params.Encode()))
+				return true
+			}
+			found = true
+		}
+	}
+
 	return false
 }

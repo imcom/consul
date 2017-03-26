@@ -1,24 +1,26 @@
 resource "aws_instance" "server" {
-    ami = "${lookup(var.ami, var.region)}"
-    instance_type = "m1.small"
+    ami = "${lookup(var.ami, "${var.region}-${var.platform}")}"
+    instance_type = "${var.instance_type}"
     key_name = "${var.key_name}"
     count = "${var.servers}"
     security_groups = ["${aws_security_group.consul.name}"]
 
     connection {
-        user = "ubuntu"
-        key_file = "${var.key_path}"
+        user = "${lookup(var.user, var.platform)}"
+        private_key = "${file("${var.key_path}")}"
+    }
+
+    #Instance tags
+    tags {
+        Name = "${var.tagName}-${count.index}"
+        ConsulRole = "Server"
     }
 
     provisioner "file" {
-        source = "${path.module}/scripts/upstart.conf"
-        destination = "/tmp/upstart.conf"
+        source = "${path.module}/../shared/scripts/${lookup(var.service_conf, var.platform)}"
+        destination = "/tmp/${lookup(var.service_conf_dest, var.platform)}"
     }
 
-    provisioner "file" {
-        source = "${path.module}/scripts/upstart-join.conf"
-        destination = "/tmp/upstart-join.conf"
-    }
 
     provisioner "remote-exec" {
         inline = [
@@ -29,15 +31,15 @@ resource "aws_instance" "server" {
 
     provisioner "remote-exec" {
         scripts = [
-            "${path.module}/scripts/install.sh",
-            "${path.module}/scripts/server.sh",
-            "${path.module}/scripts/service.sh",
+            "${path.module}/../shared/scripts/install.sh",
+            "${path.module}/../shared/scripts/service.sh",
+            "${path.module}/../shared/scripts/ip_tables.sh",
         ]
     }
 }
 
 resource "aws_security_group" "consul" {
-    name = "consul"
+    name = "consul_${var.platform}"
     description = "Consul internal traffic + maintenance."
 
     // These are for internal traffic
@@ -60,6 +62,14 @@ resource "aws_security_group" "consul" {
         from_port = 22
         to_port = 22
         protocol = "tcp"
+        cidr_blocks = ["0.0.0.0/0"]
+    }
+
+    // This is for outbound internet access
+    egress {
+        from_port = 0
+        to_port = 0
+        protocol = "-1"
         cidr_blocks = ["0.0.0.0/0"]
     }
 }
